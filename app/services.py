@@ -8,9 +8,9 @@ import os
 import sqlite3
 import tempfile
 
-from flask import current_app, g
+from flask import current_app
 
-from . import db
+from . import db, downloads
 
 KINDS = ("raw", "cleaned", "summary")
 KIND_LABELS = {"raw": "原始测量", "cleaned": "清洗表", "summary": "批次汇总"}
@@ -214,7 +214,13 @@ def register_file(file_storage, kind: str, parent_ids_raw: str) -> str:
 
 def revoke_file(file_id: str, reason: str) -> dict:
     """Revoke one file.  All transitive descendants stop downloading
-    immediately because availability is recomputed from the revoke flag."""
+    immediately because availability is recomputed from the revoke flag.
+
+    After the database commit the download gate is updated under its lock:
+    the revoked id and every descendant become non-admittable, leases of
+    downloads already in flight are cancelled, and the call waits for those
+    streams to settle so no affected download remains open once this returns.
+    """
     reason = (reason or "").strip()
     if not reason:
         raise ServiceError("请填写撤销原因")
@@ -240,17 +246,36 @@ def revoke_file(file_id: str, reason: str) -> dict:
                 "VALUES (?, 'revoke', ?)",
                 (file_id, reason),
             )
+        # Compute the blast radius inside the write transaction so the set is
+        # consistent with the committed lineage state.
+        chains = [
+            dict(r)
+            for r in db.descendant_chains(conn, file_id)
+            if r["descendant_id"] != file_id
+        ]
+        affected = sorted({r["descendant_id"] for r in chains})
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
 
-    chains = [
-        dict(r)
-        for r in db.descendant_chains(conn, file_id)
-        if r["descendant_id"] != file_id
-    ]
-    affected = sorted({r["descendant_id"] for r in chains})
+    if not already_revoked:
+        # The commit is durable; now close the download window.  This also
+        # covers descendants that were themselves revoked earlier: they stay
+        # blocked and any surviving lease is still cancelled.
+        report = downloads.get_download_manager().revoke(
+            [file_id, *affected],
+            timeout=current_app.config["DOWNLOAD_DRAIN_TIMEOUT"],
+        )
+        if not report["drained"]:
+            current_app.logger.error(
+                "revocation of %s committed but %d in-flight download(s) did "
+                "not drain within the timeout: %s; they remain cancelled and "
+                "will terminate at their next chunk check",
+                file_id,
+                sum(report["stuck"].values()),
+                report["stuck"],
+            )
     return {
         "file_id": file_id,
         "already_revoked": already_revoked,

@@ -12,11 +12,10 @@ from flask import (
     redirect,
     render_template,
     request,
-    send_file,
     url_for,
 )
 
-from . import db, services
+from . import db, downloads, services
 
 
 def create_app(config: dict | None = None) -> Flask:
@@ -30,6 +29,11 @@ def create_app(config: dict | None = None) -> Flask:
         STORAGE_DIR=os.path.join(instance, "objects"),
         STAGING_DIR=os.path.join(instance, "staging"),
         MAX_CONTENT_LENGTH=64 * 1024 * 1024,
+        # How long a revocation waits for already-open downloads to settle.
+        # Kept below the gunicorn worker timeout; overridable for tuning/tests.
+        DOWNLOAD_DRAIN_TIMEOUT=float(
+            os.environ.get("DOWNLOAD_DRAIN_TIMEOUT", downloads.DEFAULT_DRAIN_TIMEOUT)
+        ),
     )
     if config:
         app.config.update(config)
@@ -37,6 +41,21 @@ def create_app(config: dict | None = None) -> Flask:
     db.init_app(app)
     with app.app_context():
         services.sweep_working_dirs()
+        # In-process download gate.  Its blocked set is derived from the
+        # persisted database on every (re)start, so eligibility after restart
+        # stays identical while the in-flight race window can be closed.
+        manager = downloads.DownloadManager()
+        app.extensions["download_manager"] = manager
+        conn = db.get_db()
+        manager.rebuild_blocked(
+            set(db.blocked_by_map(conn))
+            | {
+                row["id"]
+                for row in conn.execute(
+                    "SELECT id FROM files WHERE revoked = 1"
+                )
+            }
+        )
 
     # -- pages -------------------------------------------------------------
 
@@ -165,7 +184,36 @@ def create_app(config: dict | None = None) -> Flask:
             # Should never happen: registration is atomic.  Fail closed.
             flash("存储对象缺失，为安全起见禁止下载，请联系管理员", "error")
             return redirect(url_for("file_detail", file_id=file_id))
-        return send_file(path, as_attachment=True, download_name=row["filename"])
+
+        # Admission under the manager lock serialises against revocation:
+        # once a revoke has marked this id blocked, no new lease is granted.
+        manager = app.extensions["download_manager"]
+        lease = manager.admit(file_id)
+        if lease is None:
+            flash(
+                f"文件 {file_id} 已撤销或被依赖阻断，下载请求未被放行",
+                "error",
+            )
+            return redirect(url_for("file_detail", file_id=file_id))
+        # Re-check before producing the attachment: a revoke committing in the
+        # admission-to-response window is answered with an explicit 409 while
+        # no byte has been promised; the response generator keeps checking per
+        # chunk for revocations landing after streaming has begun.
+        if not lease.alive():
+            manager.release(lease)
+            return (
+                f"文件 {file_id} 在下载开始前已被撤销，下载终止。\n",
+                downloads.REVOKED_HTTP_STATUS,
+                {"Content-Type": "text/plain; charset=utf-8"},
+            )
+        return downloads.RevocableFileResponse(
+            path=path,
+            file_id=file_id,
+            download_name=row["filename"],
+            lease=lease,
+            manager=manager,
+            logger=app.logger,
+        )
 
     @app.errorhandler(413)
     def too_large(_err):

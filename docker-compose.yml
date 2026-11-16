@@ -9,6 +9,9 @@ services:
       DATA_DIR: /data
       SECRET_KEY: change-me-in-production
       PORT: "8000"
+      # Seconds a revocation waits for in-flight downloads to settle; must stay
+      # below the gunicorn --timeout (60s in entrypoint.sh).
+      DOWNLOAD_DRAIN_TIMEOUT: "15"
     volumes:
       - stability_data:/data
     restart: unless-stopped
